@@ -1,0 +1,111 @@
+
+services:
+  # ----------------------------------------------------
+  # 1. OUTIL DE TICKETING (GLPI)
+  # ----------------------------------------------------
+  mariadb:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: glpi
+      MARIADB_USER: glpi
+      MARIADB_PASSWORD: ${GLPI_DB_PASSWORD}
+    command:
+      # Optimisations légères pour un environnement de test
+      - --innodb-buffer-pool-size=32M  # Réduction de 64M à 32M
+      - --max-connections=50
+      - --skip-name-resolve
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [db]
+    restart: unless-stopped
+
+  glpi:
+    image: diouxx/glpi
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      GLPI_DB_HOST: mariadb
+      GLPI_DB_USER: glpi
+      GLPI_DB_PASSWORD: ${GLPI_DB_PASSWORD}
+      GLPI_DB_NAME: glpi
+    ports:
+      - "8180:80"
+    networks: [edge, db]
+    restart: unless-stopped
+
+  # ----------------------------------------------------
+  # 2. HISTORISATION & MONITORING (InfluxDB + Grafana)
+  # Remplacement d'Elasticsearch/Kibana/Prometheus
+  # ----------------------------------------------------
+  influxdb:
+    image: influxdb:1.8
+    # InfluxDB 1.8 est plus léger que la version 2.x
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+    ports:
+      - "8086:8086"
+    networks: [data]
+    restart: unless-stopped
+    # Pas de healthcheck trop agressif
+
+  grafana:
+    image: grafana/grafana
+    # Grafana reste l'outil de monitoring (visualisation) [cite: 13]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Vous devez créer le dossier ./grafana/provisioning
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    networks: [edge, data]
+    restart: unless-stopped
+
+  telegraf:
+    image: telegraf:latest
+    # Agent de collecte de données (remplace node-exporter/cadvisor)
+    # Collecte les métriques et les envoie à InfluxDB
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Pour les métriques Docker
+    environment:
+      HOST_PROC: /host/proc
+      HOST_SYS: /host/sys
+    networks: [data]
+    depends_on:
+      - influxdb
+    restart: unless-stopped
+
+  # ----------------------------------------------------
+  # 3. DATALAKE / BDD NO-SQL (MongoDB)
+  # Remplacement de Cassandra par MongoDB (plus simple à gérer)
+  # ----------------------------------------------------
+  mongodb:
+    image: mongo:4.4
+    # Plus léger et plus facile à démarrer que Cassandra en mono-nœud
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    networks: [data]
+    restart: unless-stopped
+    
+networks:
+  edge: {}
+  data: {}
+  db: {}
+
+volumes:
+  mariadb_data: {}
+  grafana_data: {}
+  influxdb_data: {}
+  mongodb_data: {}
