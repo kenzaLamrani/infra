@@ -72,11 +72,13 @@ services:
 
   telegraf:
     image: telegraf:latest
-    # Agent de collecte de données (remplace node-exporter/cadvisor)
-    # Collecte les métriques et les envoie à InfluxDB
+    user: root  # 👈 ajoute ceci pour éviter les erreurs de permission
     volumes:
       - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Pour les métriques Docker
+      - /proc:/host/proc:ro      # 👈 nécessaire pour inputs.system, cpu, mem, disk, net
+      - /sys:/host/sys:ro        # 👈 idem
+      - /:/rootfs:ro             # 👈 optionnel, utile pour certaines métriques disque
     environment:
       HOST_PROC: /host/proc
       HOST_SYS: /host/sys
@@ -84,6 +86,7 @@ services:
     depends_on:
       - influxdb
     restart: unless-stopped
+
 
   # ----------------------------------------------------
   # 3. DATALAKE / BDD NO-SQL (MongoDB)
