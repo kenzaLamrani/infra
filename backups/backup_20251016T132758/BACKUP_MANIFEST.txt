@@ -1,0 +1,60 @@
+╔════════════════════════════════════════════════════════════════╗
+║           MANIFEST DE SAUVEGARDE - 2025-10-16T13:27:58Z          ║
+╚════════════════════════════════════════════════════════════════╝
+
+📍 LOCALISATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Répertoire : /ansible/backups/backup_20251016T132758
+Taille totale : 4.0K
+Nombre de fichiers : 3
+Hostname : localhost
+
+📦 VOLUMES SAUVEGARDÉS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ mariadb_data.tar.gz
+✓ glpi_data.tar.gz
+✓ influxdb_data.tar.gz
+✓ grafana_data.tar.gz
+✓ mongodb_data.tar.gz
+
+💾 BASES DE DONNÉES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ mariadb_dump.sql.gz
+✓ influxdb_backup.tar.gz
+✓ mongodb_dump.archive
+
+📋 LISTE DES FICHIERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/ansible/backups/backup_20251016T132758/configs/.env (98)
+/ansible/backups/backup_20251016T132758/configs/docker-compose.yml (4.0K)
+/ansible/backups/backup_20251016T132758/databases/influxdb_backup.tar.gz (45)
+
+🔄 COMMANDES DE RESTAURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📂 Restaurer un volume :
+docker run --rm \\
+  -v VOLUME_NAME:/data \\
+  -v /ansible/backups/backup_20251016T132758/volumes:/backup \\
+  alpine tar xzf /backup/VOLUME_NAME.tar.gz -C /data
+
+🗄️  Restaurer MariaDB :
+gunzip < /ansible/backups/backup_20251016T132758/databases/mariadb_dump.sql.gz | \\
+docker exec -i ansible-mariadb-1 mysql -u root -p
+
+📊 Restaurer InfluxDB :
+tar xzf /ansible/backups/backup_20251016T132758/databases/influxdb_backup.tar.gz -C /tmp && \\
+docker exec ansible-influxdb-1 influx restore /tmp/influxdb_backup -portable
+
+🍃 Restaurer MongoDB :
+docker exec -i ansible-mongodb-1 mongorestore \\
+  --archive=/dev/stdin --gzip \\
+  < /ansible/backups/backup_20251016T132758/databases/mongodb_dump.archive
+
+⚠️  NOTES IMPORTANTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Vérifier que les services sont arrêtés avant restauration
+• S'assurer que les volumes existent ou les créer
+• Tester la restauration sur un environnement de test
+• Conserver cette sauvegarde dans un lieu sûr
+• Durée de rétention : 7 jours

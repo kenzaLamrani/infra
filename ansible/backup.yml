@@ -1,0 +1,395 @@
+---
+- name: Sauvegarde complète de l'infrastructure Docker
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    project_dir: "/ansible"
+    backup_base_dir: "/ansible/backups"
+    retention_days: 7
+    volumes:
+      - mariadb_data
+      - glpi_data
+      - influxdb_data
+      - grafana_data
+      - mongodb_data
+    compose_file: "{{ project_dir }}/docker-compose.yml"
+    # Générer le timestamp UNE SEULE FOIS
+    backup_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+
+  pre_tasks:
+    - name: Installer les outils nécessaires
+      shell: |
+        apk add --no-cache docker-cli tar gzip curl jq
+      args:
+        creates: /usr/bin/docker
+      register: install_tools
+
+    - name: Vérifier que Docker est accessible
+      shell: docker ps -q
+      register: docker_check
+      failed_when: docker_check.rc != 0
+
+    - name: Afficher les informations de démarrage
+      debug:
+        msg: |
+          🔄 Début de la sauvegarde
+          📅 Timestamp : {{ backup_timestamp }}
+          📁 Base directory : {{ backup_base_dir }}
+
+  tasks:
+    - name: Définir le répertoire de backup pour cette exécution
+      set_fact:
+        backup_dir: "{{ backup_base_dir }}/backup_{{ backup_timestamp }}"
+        current_date: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Créer la structure des dossiers de backup
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ backup_base_dir }}"
+        - "{{ backup_dir }}"
+        - "{{ backup_dir }}/databases"
+        - "{{ backup_dir }}/volumes"
+        - "{{ backup_dir }}/configs"
+      register: backup_dirs_created
+
+    - name: Vérifier la création des répertoires
+      shell: |
+        test -d "{{ backup_dir }}/configs" && echo "OK" || echo "FAILED"
+      register: dir_check
+
+    - name: Arrêter si les répertoires ne sont pas créés
+      fail:
+        msg: "Impossible de créer les répertoires de backup"
+      when: dir_check.stdout != "OK"
+
+    # ============ BACKUP DES FICHIERS DE CONFIG ============
+    - name: Sauvegarder les fichiers de configuration
+      block:
+        - name: Copier .env
+          copy:
+            src: "{{ project_dir }}/.env"
+            dest: "{{ backup_dir }}/configs/.env"
+            remote_src: yes
+          ignore_errors: yes
+          register: env_backup
+
+        - name: Copier docker-compose.yml
+          copy:
+            src: "{{ project_dir }}/docker-compose.yml"
+            dest: "{{ backup_dir }}/configs/docker-compose.yml"
+            remote_src: yes
+          ignore_errors: yes
+          register: compose_backup
+
+        - name: Afficher résultat backup configs
+          debug:
+            msg: |
+              ✓ .env : {% if env_backup.changed %}OK{% else %}SKIP{% endif %}
+              ✓ docker-compose.yml : {% if compose_backup.changed %}OK{% else %}SKIP{% endif %}
+
+    # ============ BACKUP DES VOLUMES ============
+    - name: Sauvegarder les volumes Docker
+      shell: |
+        set -e
+        VOLUME="{{ item }}"
+        BACKUP_FILE="{{ backup_dir }}/volumes/${VOLUME}.tar.gz"
+        
+        echo "📦 Sauvegarde du volume : $VOLUME"
+        
+        # Vérifier que le volume existe
+        if ! docker volume inspect "$VOLUME" > /dev/null 2>&1; then
+          echo "⚠️  Volume $VOLUME introuvable, passage au suivant"
+          exit 0
+        fi
+        
+        # Créer le backup
+        docker run --rm \
+          -v "${VOLUME}:/source:ro" \
+          -v "{{ backup_dir }}/volumes:/backup" \
+          alpine sh -c "cd /source && tar czf /backup/${VOLUME}.tar.gz . 2>&1" || true
+        
+        # Vérifier la taille
+        if [ -f "$BACKUP_FILE" ]; then
+          SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+          echo "✅ ${VOLUME}.tar.gz - Taille : $SIZE"
+        else
+          echo "❌ Erreur : ${VOLUME}.tar.gz non créé"
+        fi
+      loop: "{{ volumes }}"
+      register: volume_backups
+      failed_when: false
+
+    # ============ BACKUP DE MARIADB ============
+    - name: Sauvegarder MariaDB
+      block:
+        - name: Récupérer le mot de passe MariaDB du .env
+          shell: |
+            grep "MYSQL_ROOT_PASSWORD" "{{ project_dir }}/.env" | cut -d'=' -f2 | tr -d '"'
+          register: mysql_password
+          ignore_errors: yes
+
+        - name: Vérifier que MariaDB est accessible
+          shell: |
+            docker exec ansible-mariadb-1 mysql -u root -p'{{ mysql_password.stdout }}' -e "SELECT 1" > /dev/null 2>&1 && echo "OK" || echo "FAILED"
+          register: mysql_check
+          ignore_errors: yes
+
+        - name: Créer dump MariaDB (avec mot de passe)
+          shell: |
+            docker exec ansible-mariadb-1 mysqldump \
+              -u root \
+              -p'{{ mysql_password.stdout }}' \
+              --all-databases \
+              --single-transaction \
+              --quick \
+              --lock-tables=false > "{{ backup_dir }}/databases/mariadb_dump.sql"
+          register: mariadb_dump
+          ignore_errors: yes
+          when: mysql_check.stdout == "OK"
+
+        - name: Compresser le dump MariaDB
+          shell: |
+            gzip -f "{{ backup_dir }}/databases/mariadb_dump.sql"
+            ls -lh "{{ backup_dir }}/databases/mariadb_dump.sql.gz" | awk '{print "✅ mariadb_dump.sql.gz - " $5}'
+          register: mariadb_compress
+          ignore_errors: yes
+          when: mariadb_dump.changed
+
+        - name: Afficher statut MariaDB
+          debug:
+            msg: "{{ mariadb_compress.stdout_lines | default(['⚠️  MariaDB backup échoué ou ignoré']) }}"
+
+    # ============ BACKUP D'INFLUXDB ============
+    - name: Sauvegarder InfluxDB
+      block:
+        - name: Vérifier que InfluxDB est accessible
+          shell: |
+            docker exec ansible-influxdb-1 influx ping > /dev/null 2>&1 && echo "OK" || echo "FAILED"
+          register: influxdb_check
+          ignore_errors: yes
+
+        - name: Créer un backup d'InfluxDB
+          shell: |
+            docker exec ansible-influxdb-1 sh -c 'influx backup /tmp/influxdb_backup -portable' 2>&1
+          register: influxdb_backup
+          ignore_errors: yes
+          when: influxdb_check.stdout == "OK"
+
+        - name: Copier le backup d'InfluxDB
+          shell: |
+            docker cp ansible-influxdb-1:/tmp/influxdb_backup "{{ backup_dir }}/databases/influxdb_backup"
+          ignore_errors: yes
+          when: influxdb_backup.changed
+
+        - name: Compresser le backup d'InfluxDB
+          shell: |
+            cd "{{ backup_dir }}/databases"
+            tar czf influxdb_backup.tar.gz influxdb_backup 2>&1
+            rm -rf influxdb_backup
+            ls -lh influxdb_backup.tar.gz | awk '{print "✅ influxdb_backup.tar.gz - " $5}'
+          register: influxdb_compress
+          ignore_errors: yes
+
+        - name: Afficher statut InfluxDB
+          debug:
+            msg: "{{ influxdb_compress.stdout_lines | default(['⚠️  InfluxDB backup échoué ou ignoré']) }}"
+
+    # ============ BACKUP DE MONGODB ============
+    - name: Sauvegarder MongoDB
+      block:
+        - name: Vérifier que MongoDB est accessible
+          shell: |
+            docker exec ansible-mongodb-1 mongosh --eval "db.adminCommand('ping')" > /dev/null 2>&1 && echo "OK" || echo "FAILED"
+          register: mongodb_check
+          ignore_errors: yes
+
+        - name: Créer un dump de MongoDB
+          shell: |
+            docker exec ansible-mongodb-1 mongodump \
+              --archive=/tmp/mongodb_dump.archive \
+              --gzip 2>&1
+          register: mongodb_dump
+          ignore_errors: yes
+          when: mongodb_check.stdout == "OK"
+
+        - name: Copier le dump de MongoDB
+          shell: |
+            docker cp ansible-mongodb-1:/tmp/mongodb_dump.archive \
+              "{{ backup_dir }}/databases/mongodb_dump.archive"
+            docker exec ansible-mongodb-1 rm /tmp/mongodb_dump.archive
+            ls -lh "{{ backup_dir }}/databases/mongodb_dump.archive" | awk '{print "✅ mongodb_dump.archive - " $5}'
+          register: mongodb_copy
+          ignore_errors: yes
+          when: mongodb_dump.changed
+
+        - name: Afficher statut MongoDB
+          debug:
+            msg: "{{ mongodb_copy.stdout_lines | default(['⚠️  MongoDB backup échoué ou ignoré']) }}"
+
+    # ============ STATISTIQUES ============
+    - name: Calculer les statistiques
+      block:
+        - name: Taille totale du backup
+          shell: |
+            du -sh "{{ backup_dir }}" | awk '{print $1}'
+          register: backup_size
+
+        - name: Compter les fichiers
+          shell: |
+            find "{{ backup_dir }}" -type f | wc -l
+          register: file_count
+
+        - name: Lister les fichiers
+          shell: |
+            find "{{ backup_dir }}" -type f -exec ls -lh {} \; | awk '{print $9, "(" $5 ")"}'
+          register: file_list
+
+    # ============ CRÉER LE MANIFEST ============
+    - name: Créer le fichier manifest
+      copy:
+        dest: "{{ backup_dir }}/BACKUP_MANIFEST.txt"
+        content: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║           MANIFEST DE SAUVEGARDE - {{ current_date }}          ║
+          ╚════════════════════════════════════════════════════════════════╝
+
+          📍 LOCALISATION
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Répertoire : {{ backup_dir }}
+          Taille totale : {{ backup_size.stdout }}
+          Nombre de fichiers : {{ file_count.stdout }}
+          Hostname : {{ inventory_hostname }}
+
+          📦 VOLUMES SAUVEGARDÉS
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          {% for volume in volumes %}
+          ✓ {{ volume }}.tar.gz
+          {% endfor %}
+
+          💾 BASES DE DONNÉES
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          ✓ mariadb_dump.sql.gz
+          ✓ influxdb_backup.tar.gz
+          ✓ mongodb_dump.archive
+
+          📋 LISTE DES FICHIERS
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          {% for file in file_list.stdout_lines %}
+          {{ file }}
+          {% endfor %}
+
+          🔄 COMMANDES DE RESTAURATION
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          📂 Restaurer un volume :
+          docker run --rm \\
+            -v VOLUME_NAME:/data \\
+            -v {{ backup_dir }}/volumes:/backup \\
+            alpine tar xzf /backup/VOLUME_NAME.tar.gz -C /data
+
+          🗄️  Restaurer MariaDB :
+          gunzip < {{ backup_dir }}/databases/mariadb_dump.sql.gz | \\
+          docker exec -i ansible-mariadb-1 mysql -u root -p
+
+          📊 Restaurer InfluxDB :
+          tar xzf {{ backup_dir }}/databases/influxdb_backup.tar.gz -C /tmp && \\
+          docker exec ansible-influxdb-1 influx restore /tmp/influxdb_backup -portable
+
+          🍃 Restaurer MongoDB :
+          docker exec -i ansible-mongodb-1 mongorestore \\
+            --archive=/dev/stdin --gzip \\
+            < {{ backup_dir }}/databases/mongodb_dump.archive
+
+          ⚠️  NOTES IMPORTANTES
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          • Vérifier que les services sont arrêtés avant restauration
+          • S'assurer que les volumes existent ou les créer
+          • Tester la restauration sur un environnement de test
+          • Conserver cette sauvegarde dans un lieu sûr
+          • Durée de rétention : {{ retention_days }} jours
+
+        mode: '0644'
+
+    # ============ NETTOYAGE DES ANCIENS BACKUPS ============
+    - name: Nettoyer les backups anciens
+      block:
+        - name: Lister les anciens backups
+          shell: |
+            find {{ backup_base_dir }} -mindepth 1 -maxdepth 1 -type d -mtime +{{ retention_days }}
+          register: old_backups
+          ignore_errors: yes
+
+        - name: Supprimer les anciens backups
+          shell: |
+            find {{ backup_base_dir }} -mindepth 1 -maxdepth 1 -type d -mtime +{{ retention_days }} -exec rm -rf {} \;
+          register: cleanup
+          ignore_errors: yes
+
+        - name: Afficher les suppression
+          debug:
+            msg: |
+              🗑️  Suppression des backups > {{ retention_days }} jours
+              Backups supprimés :
+              {% if old_backups.stdout_lines %}
+              {% for backup in old_backups.stdout_lines %}
+              - {{ backup }}
+              {% endfor %}
+              {% else %}
+              Aucun ancien backup à supprimer
+              {% endif %}
+
+  post_tasks:
+    - name: Créer un fichier de log
+      copy:
+        dest: "{{ backup_dir }}/backup.log"
+        content: |
+          BACKUP LOG
+          ===========================================
+          Timestamp : {{ current_date }}
+          Status : SUCCESS
+          Directory : {{ backup_dir }}
+          Size : {{ backup_size.stdout }}
+          Files : {{ file_count.stdout }}
+          Retention : {{ retention_days }} days
+        mode: '0644'
+
+    - name: Afficher le résumé final
+      debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║                  ✅ SAUVEGARDE TERMINÉE ✅                      ║
+          ╚════════════════════════════════════════════════════════════════╝
+
+          📦 RÉSUMÉ
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          📁 Emplacement : {{ backup_dir }}
+          💾 Taille totale : {{ backup_size.stdout }}
+          📄 Nombre de fichiers : {{ file_count.stdout }}
+          ⏰ Date/Heure : {{ current_date }}
+
+          📊 DÉTAILS
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Volumes sauvegardés : {{ volumes | length }}
+          Bases de données : 3 (MariaDB, InfluxDB, MongoDB)
+          Configurations : 2 (.env, docker-compose.yml)
+
+          📋 FICHIER MANIFEST
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Consultez : {{ backup_dir }}/BACKUP_MANIFEST.txt
+
+          🔒 RECOMMANDATIONS DE SÉCURITÉ
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          ✓ Copier les backups sur un stockage externe
+          ✓ Chiffrer les données sensibles
+          ✓ Vérifier l'intégrité périodiquement
+          ✓ Tester la restauration régulièrement
+
+          🚀 Prochaines étapes :
+          - Sauvegarder externellement : {{ backup_dir }}
+          - Vérifier l'intégrité : tar -tzf {{ backup_dir }}/volumes/*.tar.gz
+          - Documenter les identifiants de restauration

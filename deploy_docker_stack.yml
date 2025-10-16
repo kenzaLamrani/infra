@@ -1,0 +1,59 @@
+- name: Déploiement Local de l'Infrastructure DockerWARTS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  vars:
+    # Chemin vers le répertoire contenant docker-compose.yml et .env
+    project_root: "{{ playbook_dir }}"
+    
+  tasks:
+    - name: 1. Vérifier la présence de Docker Engine
+      command: docker --version
+      register: docker_check
+      ignore_errors: true
+      failed_when: docker_check.rc != 0
+      
+    - name: 2. Vérifier la présence de Docker Compose (V1) ou Docker Compose Plugin (V2)
+      shell: |
+        if command -v docker-compose &> /dev/null; then
+          echo "Docker Compose V1 trouvé"
+        elif docker compose version &> /dev/null; then
+          echo "Docker Compose V2 trouvé"
+        else
+          exit 1
+        fi
+      register: compose_check
+      failed_when: compose_check.rc != 0
+      
+    - name: 3. Créer les dossiers de configuration nécessaires
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ project_root }}/telegraf"
+        - "{{ project_root }}/grafana/provisioning"
+        
+    - name: 4. Vérifier la présence du fichier .env pour les variables
+      stat:
+        path: "{{ project_root }}/.env"
+      register: env_file_stat
+      failed_when: not env_file_stat.stat.exists
+      
+    - name: 5. Démarrage de l'intégralité de la stack Docker Compose (PRA - Phase Production)
+      ansible.builtin.shell: |
+        # Utilise la commande 'docker compose' (V2) par défaut, sinon 'docker-compose' (V1)
+        if command -v docker compose &> /dev/null; then
+          docker compose up -d
+        else
+          docker-compose up -d
+        fi
+      args:
+        chdir: "{{ project_root }}"
+      register: stack_status
+      changed_when: stack_status.rc == 0
+      
+    - name: 6. Afficher l'état du déploiement
+      debug:
+        msg: "Déploiement terminé. Vérifiez les logs et accédez aux URLs : http://localhost:8180 (GLPI) et http://localhost:3000 (Grafana)."

@@ -1,0 +1,140 @@
+---
+- name: Déploiement de l'infrastructure Docker
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    project_dir: "/ansible"
+    env_file: "{{ project_dir }}/.env"
+    compose_file: "{{ project_dir }}/docker-compose.yml"
+    
+  tasks:
+    - name: Installer Docker CLI et Docker Compose dans le conteneur
+      shell: |
+        apk add --no-cache docker-cli docker-cli-compose
+      args:
+        creates: /usr/bin/docker-compose
+
+    - name: Vérifier que le fichier .env existe
+      stat:
+        path: "{{ env_file }}"
+      register: env_file_check
+      
+    - name: Afficher un message si .env n'existe pas
+      debug:
+        msg: "⚠️  Attention : Le fichier .env n'existe pas. Créez-le avec les variables nécessaires."
+      when: not env_file_check.stat.exists
+      
+    - name: Arrêter si .env n'existe pas
+      fail:
+        msg: "Le fichier .env est obligatoire pour le déploiement"
+      when: not env_file_check.stat.exists
+
+    - name: Vérifier que docker-compose.yml existe
+      stat:
+        path: "{{ compose_file }}"
+      register: compose_file_check
+      
+    - name: Arrêter si docker-compose.yml n'existe pas
+      fail:
+        msg: "Le fichier docker-compose.yml est introuvable"
+      when: not compose_file_check.stat.exists
+
+    - name: Créer les répertoires nécessaires pour Grafana
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ project_dir }}/grafana/provisioning/datasources"
+        - "{{ project_dir }}/grafana/provisioning/dashboards"
+
+    - name: Créer la configuration de datasource Grafana pour InfluxDB
+      copy:
+        dest: "{{ project_dir }}/grafana/provisioning/datasources/influxdb.yml"
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: InfluxDB
+              type: influxdb
+              access: proxy
+              url: http://influxdb:8086
+              database: telegraf
+              isDefault: true
+              editable: true
+        mode: '0644'
+
+    - name: Créer la configuration de provisioning des dashboards Grafana
+      copy:
+        dest: "{{ project_dir }}/grafana/provisioning/dashboards/dashboards.yml"
+        content: |
+          apiVersion: 1
+          providers:
+            - name: 'Default'
+              orgId: 1
+              folder: ''
+              type: file
+              disableDeletion: false
+              updateIntervalSeconds: 10
+              allowUiUpdates: true
+              options:
+                path: /etc/grafana/provisioning/dashboards
+        mode: '0644'
+
+    - name: Arrêter les conteneurs existants (si présents)
+      shell: |
+        docker-compose down
+      args:
+        chdir: "{{ project_dir }}"
+      ignore_errors: yes
+
+    - name: Démarrer l'infrastructure avec Docker Compose
+      shell: |
+        docker-compose up -d
+      args:
+        chdir: "{{ project_dir }}"
+      register: compose_up
+
+    - name: Attendre que les services soient démarrés
+      pause:
+        seconds: 20
+
+    - name: Vérifier l'état des conteneurs
+      shell: |
+        docker-compose ps
+      args:
+        chdir: "{{ project_dir }}"
+      register: containers_status
+
+    - name: Afficher l'état des conteneurs
+      debug:
+        msg: "{{ containers_status.stdout_lines }}"
+
+    - name: Créer la base de données Telegraf dans InfluxDB
+      shell: |
+        docker exec ansible-influxdb-1 influx -execute 'CREATE DATABASE telegraf'
+      ignore_errors: yes
+      register: influx_db_creation
+
+    - name: Afficher les informations de connexion
+      debug:
+        msg: |
+          🚀 Déploiement terminé avec succès !
+          
+          📊 Services disponibles :
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          🎫 GLPI (Ticketing)      : http://localhost:8180
+          📈 Grafana (Monitoring)  : http://localhost:3000
+          💾 InfluxDB              : http://localhost:8086
+          🗄️  MongoDB              : mongodb://localhost:27017
+          
+          🔑 Identifiants par défaut :
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Grafana : admin / Admin123
+          GLPI    : glpi / glpi (première connexion)
+          
+          ⚙️  Commandes utiles :
+          docker-compose ps          # Voir l'état des conteneurs
+          docker-compose logs -f     # Voir les logs en temps réel
+          docker-compose restart     # Redémarrer tous les services
